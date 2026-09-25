@@ -1,0 +1,9 @@
+services:
+  - name: kelmah-jdw-proxy
+    type: web_service
+    env: node
+    plan: free
+    buildCommand: npm install
+    startCommand: node server.js
+    autoDeploy: true
+    healthCheckPath: /health

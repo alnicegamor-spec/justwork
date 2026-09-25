@@ -1,0 +1,14 @@
+{
+  "name": "jdw-proxy",
+  "version": "1.0.0",
+  "description": "OpenAI to Anthropic translator for JustWorker gateway, Render free tier ready",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "UNLICENSED",
+  "private": true
+}
