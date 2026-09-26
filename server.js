@@ -14,9 +14,7 @@ const PROXY_TOKEN = process.env.PROXY_AUTH_TOKEN || "";
 const BODY_LIMIT = parseInt(process.env.BODY_LIMIT_BYTES || "26214400", 10);
 const UPSTREAM_TIMEOUT_MS = parseInt(process.env.UPSTREAM_TIMEOUT_MS || "120000", 10);
 const MODELS = [
-  { id: "gpt-5.6-terra", context: 1050000, output: 128000 },
-  { id: "gpt-5.6-luna", context: 1050000, output: 128000 },
-  { id: "gpt-5.6-sol", context: 1050000, output: 128000 }
+  { id: "claude-opus-4-8", context: 200000, output: 32000 }
 ];
 let chatCounter = 0;
 function nextId(prefix) {
@@ -284,7 +282,7 @@ async function handleChatCompletions(req, res) {
     sendJson(res, 400, { error: { message: "invalid JSON body", type: "invalid_request" } });
     return;
   }
-  const model = oa.model || "gpt-5.6-sol";
+  const model = oa.model || "claude-opus-4-8";
   const conv = openaiMessagesToAnthropic(oa.messages);
   const antiBody = { model: model, max_tokens: pickMaxTokens(oa), messages: conv.messages };
   if (conv.system) { antiBody.system = conv.system; }
@@ -321,7 +319,7 @@ async function handleLegacyCompletions(req, res) {
     sendJson(res, 400, { error: { message: "invalid JSON body", type: "invalid_request" } });
     return;
   }
-  const model = oa.model || "gpt-5.6-sol";
+  const model = oa.model || "claude-opus-4-8";
   const prompt = oa.prompt || "";
   const suffix = oa.suffix || "";
   const full = suffix ? (String(prompt) + String(suffix)) : String(prompt);
@@ -378,3 +376,4 @@ server.listen(PORT, "0.0.0.0", function () {
   console.log("jdw-proxy listening on " + PORT + " upstream " + UPSTREAM_HOST + UPSTREAM_PATH);
 });
 module.exports = server;
+

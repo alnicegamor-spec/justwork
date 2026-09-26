@@ -187,9 +187,7 @@ function printOpenCodeSnippet(url, tokenNote) {
       npm: "@ai-sdk/openai-compatible",
       options: { baseURL: url + "/v1", apiKey: "{env:JDW_PROXY_TOKEN}" },
       models: {
-        "gpt-5.6-terra": { name: "gpt-5.6-terra", modalities: { input: ["text", "image"], output: ["text"] }, attachment: true, limit: { context: 1050000, output: 128000 } },
-        "gpt-5.6-luna": { name: "gpt-5.6-luna", modalities: { input: ["text", "image"], output: ["text"] }, attachment: true, limit: { context: 1050000, output: 128000 } },
-        "gpt-5.6-sol": { name: "gpt-5.6-sol", modalities: { input: ["text", "image"], output: ["text"] }, attachment: true, limit: { context: 1050000, output: 128000 } }
+        "claude-opus-4-8": { name: "claude-opus-4-8", modalities: { input: ["text", "image"], output: ["text"] }, attachment: true, limit: { context: 200000, output: 32000 } }
       }
     }
   }, null, 2));
@@ -306,6 +304,7 @@ async function main() {
   printOpenCodeSnippet(url, secrets.generated ? "the generated token printed above" : "the same PROXY_AUTH_TOKEN value");
 }
 main().catch(function (e) { console.error("Fatal error: " + (e && e.message)); process.exitCode = 1; });
+
 
 
 
