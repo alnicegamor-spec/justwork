@@ -61,6 +61,10 @@ function buildEnvVars(secrets) {
   ];
   if (process.env.UPSTREAM_HOST) { vars.push({ key: "UPSTREAM_HOST", value: process.env.UPSTREAM_HOST }); }
   if (process.env.UPSTREAM_PATH) { vars.push({ key: "UPSTREAM_PATH", value: process.env.UPSTREAM_PATH }); }
+  if (process.env.UPSTREAM_TIMEOUT_MS) { vars.push({ key: "UPSTREAM_TIMEOUT_MS", value: process.env.UPSTREAM_TIMEOUT_MS }); }
+  if (process.env.MODEL_CONTEXT) { vars.push({ key: "MODEL_CONTEXT", value: process.env.MODEL_CONTEXT }); }
+  if (process.env.MODEL_OUTPUT) { vars.push({ key: "MODEL_OUTPUT", value: process.env.MODEL_OUTPUT }); }
+  if (process.env.MODEL_OVERHEAD) { vars.push({ key: "MODEL_OVERHEAD", value: process.env.MODEL_OVERHEAD }); }
   return vars;
 }
 function buildPayload(secrets) {
@@ -184,10 +188,10 @@ function printOpenCodeSnippet(url, tokenNote) {
   console.log(JSON.stringify({
     justdowork: {
       name: "Justworker",
-      npm: "@ai-sdk/openai-compatible",
-      options: { baseURL: url + "/v1", apiKey: "{env:JDW_PROXY_TOKEN}" },
+      package: "@opencode/ai/providers/openai-compatible",
+      settings: { baseURL: url + "/v1", apiKey: "{env:JDW_PROXY_TOKEN}" },
       models: {
-        "claude-opus-4-8": { name: "claude-opus-4-8", modalities: { input: ["text", "image"], output: ["text"] }, attachment: true, limit: { context: 200000, output: 32000 } }
+        "claude-opus-4-8": { name: "claude-opus-4-8", capabilities: { tools: true, input: ["text", "image"], output: ["text"] }, limit: { context: 193000, output: 32000 } }
       }
     }
   }, null, 2));

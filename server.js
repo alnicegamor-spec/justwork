@@ -12,9 +12,18 @@ const UPSTREAM_PATH = process.env.UPSTREAM_PATH || "/v1/messages";
 const UPSTREAM_KEY = process.env.JUSTWOKER_API_KEY || "";
 const PROXY_TOKEN = process.env.PROXY_AUTH_TOKEN || "";
 const BODY_LIMIT = parseInt(process.env.BODY_LIMIT_BYTES || "26214400", 10);
-const UPSTREAM_TIMEOUT_MS = parseInt(process.env.UPSTREAM_TIMEOUT_MS || "120000", 10);
+const UPSTREAM_TIMEOUT_MS = parseInt(process.env.UPSTREAM_TIMEOUT_MS || "300000", 10);
+// Model context numbers, env-overridable. Verified 2026-10-01 against
+// https://api.justwoker.icu/v1 (New-API style gateway, /v1/models needs auth):
+// max_tokens up to 128000 accepted, and the gateway reports ~6600 input
+// tokens on a 6-word prompt, i.e. a fixed ~6.6k-token overhead per request.
+// MODEL_OVERHEAD reserves that (rounded up) so guarded/advertised limits
+// reflect usable context, not the raw upstream window.
+const MODEL_CONTEXT = parseInt(process.env.MODEL_CONTEXT || "200000", 10);
+const MODEL_OUTPUT = parseInt(process.env.MODEL_OUTPUT || "32000", 10);
+const MODEL_OVERHEAD = parseInt(process.env.MODEL_OVERHEAD || "7000", 10);
 const MODELS = [
-  { id: "claude-opus-4-8", context: 200000, output: 32000 }
+  { id: "claude-opus-4-8", context: MODEL_CONTEXT, output: MODEL_OUTPUT }
 ];
 let chatCounter = 0;
 function nextId(prefix) {
@@ -160,7 +169,7 @@ function openaiMessagesToAnthropic(oaMessages) {
   if (systemParts.length > 0) { system = systemParts.join("\n\n"); }
   return { system: system, messages: messages };
 }
-function upstreamMessages(antiBody, apiKey) {
+function upstreamMessages(antiBody, apiKey, retried) {
   return new Promise(function (resolve, reject) {
     const payload = JSON.stringify(antiBody);
     const opts = {
@@ -178,6 +187,14 @@ function upstreamMessages(antiBody, apiKey) {
       const chunks = [];
       res.on("data", function (c) { chunks.push(c); });
       res.on("end", function () {
+        // Transient gateway edge flakes (observed: empty-body 403 on an
+        // otherwise healthy request). Retry once after a short delay.
+        if ((res.statusCode === 403 || res.statusCode === 429) && !retried) {
+          setTimeout(function () {
+            upstreamMessages(antiBody, apiKey, true).then(resolve, reject);
+          }, 1500);
+          return;
+        }
         const raw = Buffer.concat(chunks).toString("utf8");
         let parsed = null;
         try { parsed = JSON.parse(raw); } catch (e) { parsed = null; }
@@ -196,6 +213,27 @@ function upstreamMessages(antiBody, apiKey) {
     req.write(payload);
     req.end();
   });
+}
+// ~4 chars per token heuristic plus the measured gateway overhead.
+// Used to fail fast with a clear 400 instead of a 120s+ "upstream timeout"
+// followed by full-payload retries.
+function estimateInputTokens(antiBody) {
+  let chars = 0;
+  try {
+    chars = JSON.stringify(antiBody.messages || []).length
+      + JSON.stringify(antiBody.system || "").length
+      + JSON.stringify(antiBody.tools || []).length;
+  } catch (e) { return MODEL_CONTEXT; }
+  return Math.ceil(chars / 4) + MODEL_OVERHEAD;
+}
+function checkContext(antiBody, maxTokens) {
+  const est = estimateInputTokens(antiBody);
+  if (est + maxTokens > MODEL_CONTEXT) {
+    return "context length exceeded: est. input ~" + est + " tokens + max_tokens "
+      + maxTokens + " > model context " + MODEL_CONTEXT
+      + " (includes ~" + MODEL_OVERHEAD + " gateway overhead). Shorten the conversation or compact context.";
+  }
+  return null;
 }
 function anthropicStopToOpenAI(stop) {
   if (stop === "max_tokens") { return "length"; }
@@ -292,6 +330,11 @@ async function handleChatCompletions(req, res) {
   if (toolChoice) { antiBody.tool_choice = toolChoice; }
   if (typeof oa.temperature === "number") { antiBody.temperature = oa.temperature; }
   if (typeof oa.top_p === "number") { antiBody.top_p = oa.top_p; }
+  const over = checkContext(antiBody, antiBody.max_tokens);
+  if (over) {
+    sendJson(res, 400, { error: { message: over, type: "context_length_exceeded" } });
+    return;
+  }
   let anti = null;
   try {
     anti = await upstreamMessages(antiBody, apiKey);
@@ -325,6 +368,11 @@ async function handleLegacyCompletions(req, res) {
   const full = suffix ? (String(prompt) + String(suffix)) : String(prompt);
   const antiBody = { model: model, max_tokens: pickMaxTokens(oa), messages: [{ role: "user", content: full || "complete the code" }] };
   if (typeof oa.temperature === "number") { antiBody.temperature = oa.temperature; }
+  const overLegacy = checkContext(antiBody, antiBody.max_tokens);
+  if (overLegacy) {
+    sendJson(res, 400, { error: { message: overLegacy, type: "context_length_exceeded" } });
+    return;
+  }
   let anti = null;
   try {
     anti = await upstreamMessages(antiBody, apiKey);
@@ -355,8 +403,10 @@ async function handleLegacyCompletions(req, res) {
   sendJson(res, 200, out);
 }
 function handleModels(req, res) {
+  // Advertise effective usable context (raw window minus gateway overhead)
+  // so clients plan compaction against what really fits.
   const data = MODELS.map(function (m) {
-    return { id: m.id, object: "model", created: 1789135475, owned_by: "justworker", context_window: m.context, max_output_tokens: m.output };
+    return { id: m.id, object: "model", created: 1789135475, owned_by: "justworker", context_window: Math.max(0, m.context - MODEL_OVERHEAD), max_output_tokens: m.output };
   });
   sendJson(res, 200, { object: "list", data: data });
 }
