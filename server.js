@@ -11,6 +11,8 @@ const UPSTREAM_HOST = process.env.UPSTREAM_HOST || "api.justwoker.icu";
 const UPSTREAM_PATH = process.env.UPSTREAM_PATH || "/v1/messages";
 const UPSTREAM_KEY = process.env.JUSTWOKER_API_KEY || "";
 const PROXY_TOKEN = process.env.PROXY_AUTH_TOKEN || "";
+const UPSTREAM_PROTO = process.env.UPSTREAM_PROTO || "https";
+const UPSTREAM_PORT = parseInt(process.env.UPSTREAM_PORT || "443", 10);
 const BODY_LIMIT = parseInt(process.env.BODY_LIMIT_BYTES || "26214400", 10);
 const UPSTREAM_TIMEOUT_MS = parseInt(process.env.UPSTREAM_TIMEOUT_MS || "300000", 10);
 // Model context numbers, env-overridable. Verified 2026-10-01 against
@@ -273,31 +275,221 @@ function anthropicToOpenAIResponse(anti, model) {
     }
   };
 }
-function sendOpenAIStream(res, completion) {
-  setCors(res);
-  res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive" });
-  const msg = completion.choices[0].message || {};
-  const finish = completion.choices[0].finish_reason || "stop";
-  const base = { id: completion.id, object: "chat.completion.chunk", created: completion.created, model: completion.model };
-  function emit(delta, finishReason) {
-    const chunk = JSON.stringify({
-      id: base.id, object: base.object, created: base.created, model: base.model,
-      choices: [{ index: 0, delta: delta, finish_reason: finishReason || null }]
-    });
-    res.write("data: " + chunk + "\n\n");
-  }
-  emit({ role: "assistant" }, null);
-  if (msg.tool_calls) {
-    for (let i = 0; i < msg.tool_calls.length; i++) {
-      const tc = msg.tool_calls[i];
-      emit({ tool_calls: [{ index: i, id: tc.id, type: "function", function: { name: tc.function.name, arguments: tc.function.arguments } }] }, null);
+// Live streaming passthrough: the gateway 524s non-streaming requests whose
+// first byte takes >~100s, so ALL upstream calls go out with stream:true.
+function postUpstream(antiBody, apiKey, callback) {
+  const out = Object.assign({}, antiBody, { stream: true });
+  const payload = JSON.stringify(out);
+  const transport = UPSTREAM_PROTO === "http" ? http : https;
+  const opts = {
+    hostname: UPSTREAM_HOST,
+    port: UPSTREAM_PORT,
+    path: UPSTREAM_PATH,
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Content-Length": Buffer.byteLength(payload),
+      "Authorization": "Bearer " + apiKey,
+      "Accept": "text/event-stream"
     }
-  } else if (msg.content) {
-    emit({ content: msg.content }, null);
+  };
+  let called = false;
+  function done(e, req, res) { if (!called) { called = true; callback(e, req, res); } }
+  let req = null;
+  try {
+    req = transport.request(opts, function (res) { done(null, req, res); });
+  } catch (e) { done(e); return null; }
+  req.on("error", function (e) { done(e); });
+  req.setTimeout(UPSTREAM_TIMEOUT_MS, function () { req.destroy(new Error("upstream timeout")); });
+  req.write(payload);
+  req.end();
+  return req;
+}
+function readUpstreamError(upRes, callback) {
+  const chunks = [];
+  upRes.on("data", function (c) { chunks.push(c); });
+  upRes.on("end", function () {
+    const raw = Buffer.concat(chunks).toString("utf8");
+    let parsed = null;
+    try { parsed = JSON.parse(raw); } catch (e) { parsed = null; }
+    const msg = (parsed && parsed.error && (parsed.error.message || JSON.stringify(parsed.error))) || raw.slice(0, 500);
+    const err = new Error("upstream " + upRes.statusCode + ": " + msg);
+    err.status = upRes.statusCode;
+    callback(err);
+  });
+  upRes.on("error", function (e) { callback(e); });
+}
+function newStreamState(model) {
+  return {
+    id: nextId("chatcmpl-"), created: Math.floor(Date.now() / 1000), model: model,
+    sentRole: false, toolIndex: -1, toolBlock: {}, stopReason: null,
+    inputTokens: 0, outputTokens: 0, text: "", tools: []
+  };
+}
+// Sink events: {role} {text} {toolStart:{index,id,name}}
+// {toolArgs:{index,partial}} {done} {upstreamError}
+function translateFrame(st, event, data, sink) {
+  if (!data || typeof data !== "object") { return; }
+  if (event === "message_start") {
+    const u = data.message && data.message.usage;
+    if (u) {
+      if (typeof u.input_tokens === "number") { st.inputTokens = u.input_tokens; }
+      if (typeof u.output_tokens === "number") { st.outputTokens = u.output_tokens; }
+    }
+    sink({ role: true });
+    return;
   }
-  emit({}, finish);
-  res.write("data: [DONE]\n\n");
-  res.end();
+  if (event === "content_block_start") {
+    const b = data.content_block || {};
+    if (b.type === "tool_use") {
+      st.toolIndex++;
+      st.toolBlock[data.index] = st.toolIndex;
+      st.tools[st.toolIndex] = { id: b.id || nextId("call_"), name: b.name || "unknown", args: "" };
+      sink({ toolStart: { index: st.toolIndex, id: st.tools[st.toolIndex].id, name: st.tools[st.toolIndex].name } });
+    }
+    return;
+  }
+  if (event === "content_block_delta") {
+    const d = data.delta || {};
+    if (d.type === "text_delta" && d.text) { st.text += d.text; sink({ text: d.text }); }
+    else if (d.type === "input_json_delta" && d.partial_json) {
+      const ti = st.toolBlock[data.index];
+      if (ti !== undefined && st.tools[ti]) {
+        st.tools[ti].args += d.partial_json;
+        sink({ toolArgs: { index: ti, partial: d.partial_json } });
+      }
+    }
+    return;
+  }
+  if (event === "message_delta") {
+    const d = data.delta || {};
+    if (d.stop_reason) { st.stopReason = d.stop_reason; }
+    if (data.usage && typeof data.usage.output_tokens === "number") { st.outputTokens = data.usage.output_tokens; }
+    return;
+  }
+  if (event === "message_stop") { sink({ done: true }); return; }
+  if (event === "error" || data.type === "error") {
+    const e = data.error || {};
+    sink({ upstreamError: String(e.message || JSON.stringify(e)) });
+    return;
+  }
+}
+function pumpSSE(upRes, onFrame, onEnd) {
+  let buf = "";
+  let finished = false;
+  function end(e) { if (!finished) { finished = true; onEnd(e); } }
+  upRes.on("data", function (c) {
+    buf += c.toString("utf8");
+    let idx;
+    while ((idx = buf.indexOf("\n\n")) >= 0) {
+      const frame = buf.slice(0, idx);
+      buf = buf.slice(idx + 2);
+      let event = "message";
+      const lines = frame.split("\n");
+      for (const line of lines) {
+        if (line.indexOf("event:") === 0) { event = line.slice(6).trim(); }
+        else if (line.indexOf("data:") === 0) {
+          const payload = line.slice(5).trim();
+          if (payload === "[DONE]") { onFrame("done", "[DONE]"); }
+          else {
+            try { onFrame(event, JSON.parse(payload)); }
+            catch (e) { /* corrupt frame, skip */ }
+          }
+        }
+      }
+    }
+  });
+  upRes.on("end", function () { end(null); });
+  upRes.on("error", function (e) { end(e); });
+}
+function anthropicFinish(st) {
+  if (st.toolIndex >= 0) { return "tool_calls"; }
+  return anthropicStopToOpenAI(st.stopReason);
+}
+function pipeStreamToClient(upReq, upRes, clientRes, model) {
+  setCors(clientRes);
+  clientRes.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive" });
+  const st = newStreamState(model);
+  let ended = false;
+  function emit(delta, finishReason) {
+    if (ended) { return; }
+    clientRes.write("data: " + JSON.stringify({
+      id: st.id, object: "chat.completion.chunk", created: st.created, model: st.model,
+      choices: [{ index: 0, delta: delta, finish_reason: finishReason || null }]
+    }) + "\n\n");
+  }
+  function ensureRole() { if (!st.sentRole) { st.sentRole = true; emit({ role: "assistant" }, null); } }
+  function finish(reason) {
+    if (ended) { return; }
+    ensureRole();
+    ended = true;
+    try {
+      clientRes.write("data: " + JSON.stringify({
+        id: st.id, object: "chat.completion.chunk", created: st.created, model: st.model,
+        choices: [{ index: 0, delta: {}, finish_reason: reason || null }]
+      }) + "\n\n");
+      clientRes.write("data: [DONE]\n\n");
+    } catch (e) {}
+    try { clientRes.end(); } catch (e) {}
+  }
+  clientRes.on("close", function () { ended = true; try { upReq.destroy(); } catch (e) {} });
+  pumpSSE(upRes, function (event, data) {
+    if (ended) { return; }
+    if (event === "done") { finish(anthropicFinish(st)); return; }
+    translateFrame(st, event, data, function (ev) {
+      if (ended) { return; }
+      if (ev.role) { ensureRole(); }
+      else if (ev.text !== undefined) { ensureRole(); emit({ content: ev.text }, null); }
+      else if (ev.toolStart) { ensureRole(); emit({ tool_calls: [{ index: ev.toolStart.index, id: ev.toolStart.id, type: "function", function: { name: ev.toolStart.name, arguments: "" } }] }, null); }
+      else if (ev.toolArgs) { emit({ tool_calls: [{ index: ev.toolArgs.index, function: { arguments: ev.toolArgs.partial } }] }, null); }
+      else if (ev.done) { finish(anthropicFinish(st)); }
+      else if (ev.upstreamError) { ensureRole(); emit({ content: "upstream stream error: " + ev.upstreamError }, null); finish("stop"); }
+    });
+  }, function (err) {
+    if (ended) { return; }
+    if (err) { ensureRole(); emit({ content: "upstream stream error: " + String((err && err.message) || err) }, null); }
+    finish(anthropicFinish(st));
+  });
+}
+function synthesisToCompletion(st, model) {
+  const blocks = [];
+  if (st.text) { blocks.push({ type: "text", text: st.text }); }
+  for (const t of st.tools) {
+    let input = {};
+    try { input = t.args ? JSON.parse(t.args) : {}; }
+    catch (e) { input = { raw: t.args }; }
+    blocks.push({ type: "tool_use", id: t.id, name: t.name, input: input });
+  }
+  return anthropicToOpenAIResponse({
+    content: blocks,
+    stop_reason: st.stopReason || (st.toolIndex >= 0 ? "tool_use" : "end_turn"),
+    usage: { input_tokens: st.inputTokens, output_tokens: st.outputTokens }
+  }, model);
+}
+function bufferStreamToCompletion(upReq, upRes, clientRes, model) {
+  const st = newStreamState(model);
+  let called = false;
+  function done(e, completion) {
+    if (called) { return; }
+    called = true;
+    if (e) { sendJson(clientRes, 502, { error: { message: String((e && e.message) || e), type: "upstream_error" } }); return; }
+    sendJson(clientRes, 200, completion);
+  }
+  clientRes.on("close", function () { called = true; try { upReq.destroy(); } catch (e) {} });
+  pumpSSE(upRes, function (event, data) {
+    if (called) { return; }
+    if (event === "done") { done(null, synthesisToCompletion(st, model)); return; }
+    translateFrame(st, event, data, function (ev) {
+      if (called) { return; }
+      if (ev.done) { done(null, synthesisToCompletion(st, model)); }
+      else if (ev.upstreamError) { done(new Error("upstream stream error: " + ev.upstreamError)); }
+    });
+  }, function (err) {
+    if (called) { return; }
+    if (err) { done(err); return; }
+    if (st.text || st.toolIndex >= 0) { done(null, synthesisToCompletion(st, model)); }
+    else { done(new Error("upstream closed stream with no content")); }
+  });
 }
 function pickMaxTokens(oa) {
   const v = oa.max_tokens || oa.max_completion_tokens || 1024;
@@ -335,17 +527,30 @@ async function handleChatCompletions(req, res) {
     sendJson(res, 400, { error: { message: over, type: "context_length_exceeded" } });
     return;
   }
-  let anti = null;
-  try {
-    anti = await upstreamMessages(antiBody, apiKey);
-  } catch (e) {
+  function upstreamFailed(e) {
     const code = e && e.status === 401 ? 401 : 502;
     sendJson(res, code, { error: { message: String((e && e.message) || e), type: "upstream_error" } });
+  }
+  function callUpstream() {
+    return new Promise(function (resolve) {
+      const upReq = postUpstream(antiBody, apiKey, function (e, req, upRes) {
+        if (e) { upstreamFailed(e); resolve(null); return; }
+        if (upRes.statusCode < 200 || upRes.statusCode >= 300) {
+          readUpstreamError(upRes, function (err) { upstreamFailed(err); resolve(null); });
+          return;
+        }
+        resolve({ upReq: req, upRes: upRes });
+      });
+      void upReq;
+    });
+  }
+  if (oa.stream) {
+    const live = await callUpstream();
+    if (live) { pipeStreamToClient(live.upReq, live.upRes, res, model); }
     return;
   }
-  const completion = anthropicToOpenAIResponse(anti, model);
-  if (oa.stream) { sendOpenAIStream(res, completion); return; }
-  sendJson(res, 200, completion);
+  const buffered = await callUpstream();
+  if (buffered) { bufferStreamToCompletion(buffered.upReq, buffered.upRes, res, model); }
 }
 async function handleLegacyCompletions(req, res) {
   if (!checkProxyAuth(req, res)) { return; }
