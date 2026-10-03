@@ -650,7 +650,7 @@ function handleModels(req, res) {
   sendJson(res, 200, { object: "list", data: data });
 }
 function handleHealth(req, res) {
-  sendJson(res, 200, { ok: true, upstream: UPSTREAM_HOST + UPSTREAM_PATH, models: MODELS.map(function (m) { return m.id; }), auth: PROXY_TOKEN ? "token" : "open", time: new Date().toISOString() });
+  sendJson(res, 200, { ok: true, upstream: UPSTREAM_HOST + UPSTREAM_PATH, models: MODELS.map(function (m) { return m.id; }), auth: PROXY_TOKEN ? "token" : "open", version: process.env.RENDER_GIT_COMMIT || "local", time: new Date().toISOString() });
 }
 const server = http.createServer(function (req, res) {
   if (req.method === "OPTIONS") { setCors(res); res.writeHead(204); res.end(); return; }
