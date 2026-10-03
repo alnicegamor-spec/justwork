@@ -15,6 +15,14 @@ const UPSTREAM_PROTO = process.env.UPSTREAM_PROTO || "https";
 const UPSTREAM_PORT = parseInt(process.env.UPSTREAM_PORT || "443", 10);
 const BODY_LIMIT = parseInt(process.env.BODY_LIMIT_BYTES || "26214400", 10);
 const UPSTREAM_TIMEOUT_MS = parseInt(process.env.UPSTREAM_TIMEOUT_MS || "300000", 10);
+// Non-stream generations get no bytes until complete, and the Cloudflare edge
+// kills the connection at ~120s (observed 524s). Cap below that for a clean
+// error instead of an edge kill.
+const NONSTREAM_TIMEOUT_MS = parseInt(process.env.NONSTREAM_TIMEOUT_MS || "115000", 10);
+// Reused keep-alive agents: skip a fresh TLS handshake (~200-500ms) on every
+// upstream request instead of connecting from scratch each time.
+const keepAliveHttps = new https.Agent({ keepAlive: true, maxSockets: 8 });
+const keepAliveHttp = new http.Agent({ keepAlive: true, maxSockets: 8 });
 const DEBUG_SSE = process.env.DEBUG_SSE === "1";
 // Model context numbers, env-overridable. Verified 2026-10-01 against
 // https://api.justwoker.icu/v1 (New-API style gateway, /v1/models needs auth):
@@ -185,7 +193,7 @@ function openaiMessagesToAnthropic(oaMessages) {
   if (systemParts.length > 0) { system = systemParts.join("\n\n"); }
   return { system: system, messages: messages };
 }
-function upstreamMessages(antiBody, apiKey, retried) {
+function upstreamMessages(antiBody, apiKey, retried, timeoutMs) {
   return new Promise(function (resolve, reject) {
     const payload = JSON.stringify(antiBody);
     const opts = {
@@ -193,6 +201,7 @@ function upstreamMessages(antiBody, apiKey, retried) {
       port: 443,
       path: UPSTREAM_PATH,
       method: "POST",
+      agent: keepAliveHttps,
       headers: {
         "Content-Type": "application/json",
         "Content-Length": Buffer.byteLength(payload),
@@ -207,7 +216,7 @@ function upstreamMessages(antiBody, apiKey, retried) {
         // otherwise healthy request). Retry once after a short delay.
         if ((res.statusCode === 403 || res.statusCode === 429) && !retried) {
           setTimeout(function () {
-            upstreamMessages(antiBody, apiKey, true).then(resolve, reject);
+            upstreamMessages(antiBody, apiKey, true, timeoutMs).then(resolve, reject);
           }, 1500);
           return;
         }
@@ -225,7 +234,7 @@ function upstreamMessages(antiBody, apiKey, retried) {
       });
     });
     req.on("error", reject);
-    req.setTimeout(UPSTREAM_TIMEOUT_MS, function () { req.destroy(new Error("upstream timeout")); });
+    req.setTimeout(timeoutMs || UPSTREAM_TIMEOUT_MS, function () { req.destroy(new Error("upstream timeout")); });
     req.write(payload);
     req.end();
   });
@@ -363,6 +372,7 @@ function postUpstream(antiBody, apiKey, callback) {
     port: UPSTREAM_PORT,
     path: UPSTREAM_PATH,
     method: "POST",
+    agent: transport === http ? keepAliveHttp : keepAliveHttps,
     headers: {
       "Content-Type": "application/json",
       "Content-Length": Buffer.byteLength(payload),
@@ -789,35 +799,29 @@ async function handleChatCompletions(req, res) {
   }
   function upstreamFailed(e) {
     const code = e && e.status === 401 ? 401 : 502;
-    sendJson(res, code, { error: { message: String((e && e.message) || e), type: "upstream_error" } });
+    let detail = String((e && e.message) || e);
+    if (e && (e.status === 524 || /upstream timeout/.test(detail))) {
+      detail += " Generation exceeded the ~120s Cloudflare window. Split the task, shorten context, wait 120s, then retry.";
+    }
+    sendJson(res, code, { error: { message: detail, type: "upstream_error" } });
   }
-  // Attempt 1: streaming probe. Fast and Cloudflare-safe, but this gateway
-  // currently streams zero content blocks (empty turn, billed tokens).
-  // Attempt 2 (fallback): full non-streaming request, which returns text.
-  let probe = null;
-  let probeErr = null;
-  try {
-    probe = await collectStreamAttempt(antiBody, apiKey);
-  } catch (e) { probeErr = e; }
-  if (probe && (probe.st.text || probe.st.toolIndex >= 0)) {
-    try {
-      console.log("[chat] mode=stream-hit model=" + model + " textLen=" + probe.st.text.length
-        + " tools=" + (probe.st.toolIndex + 1) + " frames=" + probe.collect.frames + " ms=" + (Date.now() - t0)
-        + " " + imgSummary(antiBody.messages) + " reqTools=" + reqTools);
-    } catch (logE) {}
-    deliverCompletion(synthesisToCompletion(probe.st, model));
-    return;
-  }
-  try {
-    console.log("[chat] mode=fallback model=" + model
-      + " reason=" + (probeErr ? ("streamErr:" + String((probeErr && probeErr.message) || probeErr).slice(0, 120)) : ("empty:" + (probe ? probe.collect.frames : 0) + "frames"))
-      + " ms=" + (Date.now() - t0) + " " + imgSummary(antiBody.messages) + " reqTools=" + reqTools);
-  } catch (logE) {}
+  // Single non-streaming attempt. The gateway's streaming path bills tokens
+  // but yields zero content blocks, so a streaming-first probe only added
+  // latency and double billing. Slow generations can still hit the ~120s
+  // edge cap and fail here with a clear message.
   let anti = null;
+  const t1 = Date.now();
   try {
-    anti = await upstreamMessages(antiBody, apiKey);
+    anti = await upstreamMessages(antiBody, apiKey, false, NONSTREAM_TIMEOUT_MS);
   } catch (e) { upstreamFailed(e); return; }
-  deliverCompletion(anthropicToOpenAIResponse(anti, model));
+  const completion = anthropicToOpenAIResponse(anti, model);
+  try {
+    const u = (anti && anti.usage) || {};
+    console.log("[chat] mode=direct model=" + model + " inTok=" + (u.input_tokens || 0)
+      + " outTok=" + (u.output_tokens || 0) + " ms=" + (Date.now() - t1)
+      + " " + imgSummary(antiBody.messages) + " reqTools=" + reqTools);
+  } catch (logE) {}
+  deliverCompletion(completion);
 }
 async function handleLegacyCompletions(req, res) {
   if (!checkProxyAuth(req, res)) { return; }
