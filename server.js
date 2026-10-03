@@ -76,6 +76,22 @@ function resolveUpstreamKey(req) {
   if (UPSTREAM_KEY) { return UPSTREAM_KEY; }
   return bearerKey(req);
 }
+function imagePartFromUrl(url) {
+  if (typeof url !== "string" || !url) { return null; }
+  if (url.indexOf("data:image/") === 0) {
+    const comma = url.indexOf(",");
+    const header = url.slice(0, comma);
+    const b64 = url.slice(comma + 1);
+    if (!b64) { return null; }
+    const m = header.match(/data:image\/([a-zA-Z0-9.+-]+)/);
+    const mime = m ? ("image/" + m[1].toLowerCase()) : "image/jpeg";
+    return { type: "image", source: { type: "base64", media_type: mime, data: b64 } };
+  }
+  if (url.indexOf("http://") === 0 || url.indexOf("https://") === 0) {
+    return { type: "image", source: { type: "url", url: url } };
+  }
+  return null;
+}
 function convertContentToAnthropic(openaiContent) {
   if (typeof openaiContent === "string") { return openaiContent; }
   if (!Array.isArray(openaiContent)) { return ""; }
@@ -85,15 +101,12 @@ function convertContentToAnthropic(openaiContent) {
     if (block.type === "text") {
       parts.push({ type: "text", text: block.text || "" });
     } else if (block.type === "image_url" && block.image_url && block.image_url.url) {
-      const url = block.image_url.url;
-      if (url.indexOf("data:image/") === 0) {
-        const comma = url.indexOf(",");
-        const header = url.slice(0, comma);
-        const b64 = url.slice(comma + 1);
-        const m = header.match(/data:image\/([a-zA-Z0-9.+-]+)/);
-        const mime = m ? ("image/" + m[1].toLowerCase()) : "image/jpeg";
-        parts.push({ type: "image", source: { type: "base64", media_type: mime, data: b64 } });
-      }
+      const part = imagePartFromUrl(block.image_url.url);
+      if (part) { parts.push(part); }
+    } else if (block.type === "input_image" && block.image_url) {
+      const raw = typeof block.image_url === "string" ? block.image_url : block.image_url.url;
+      const part = imagePartFromUrl(raw);
+      if (part) { parts.push(part); }
     } else if (block.type === "input_text" && block.text) {
       parts.push({ type: "text", text: block.text });
     }
@@ -222,12 +235,24 @@ function upstreamMessages(antiBody, apiKey, retried) {
 // followed by full-payload retries.
 function estimateInputTokens(antiBody) {
   let chars = 0;
+  let images = 0;
   try {
-    chars = JSON.stringify(antiBody.messages || []).length
-      + JSON.stringify(antiBody.system || "").length
-      + JSON.stringify(antiBody.tools || []).length;
+    (function walk(v) {
+      if (typeof v === "string") { chars += v.length; return; }
+      if (Array.isArray(v)) { for (const x of v) { walk(x); } return; }
+      if (v && typeof v === "object") {
+        if (v.type === "image" && v.source && v.source.type === "base64" && typeof v.source.data === "string") {
+          images++;
+          if (typeof v.source.media_type === "string") { chars += v.source.media_type.length; }
+          return;
+        }
+        for (const k of Object.keys(v)) { walk(v[k]); }
+      }
+    })([antiBody.messages || [], antiBody.system || "", antiBody.tools || []]);
   } catch (e) { return MODEL_CONTEXT; }
-  return Math.ceil(chars / 4) + MODEL_OVERHEAD;
+  // Anthropic bills images separately (~1-2k tokens each). Raw base64 would
+  // otherwise fake ~750k tokens per screenshot and trip the context guard.
+  return Math.ceil(chars / 4) + MODEL_OVERHEAD + images * 1600;
 }
 function checkContext(antiBody, maxTokens) {
   const est = estimateInputTokens(antiBody);
