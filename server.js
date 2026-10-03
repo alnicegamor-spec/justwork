@@ -569,10 +569,10 @@ function pickMaxTokens(oa) {
   if (!n || n < 1) { return 1024; }
   return Math.min(n, 128000);
 }
-// The gateway answers short turns with thinking-only (redacted) blocks when
-// thinking is left unset: 0 streamed content frames, billed output tokens,
-// end_turn. So always be explicit. Default disabled; enable only when the
-// client asks via OpenAI-style reasoning signals, mapped to budgets.
+// Be explicit about thinking. Default disabled; enable only when the client
+// asks via OpenAI-style reasoning signals, mapped to budgets. (The empty
+// turns observed 2026-10-03 come from the gateway's streaming path, not from
+// an unset thinking flag: identical bodies return text non-streamed.)
 function pickThinking(oa, maxTokens) {
   let effort = null;
   if (oa.reasoning && typeof oa.reasoning.effort === "string") { effort = oa.reasoning.effort; }
@@ -587,6 +587,64 @@ function pickThinking(oa, maxTokens) {
   else { return { type: "disabled" }; }
   if (maxTokens <= budget + 256) { return { type: "disabled" }; }
   return { type: "enabled", budget_tokens: budget };
+}
+// Collect a streaming upstream attempt without writing to the client, so the
+// caller can decide (content vs empty/broken) before delivering anything.
+function collectStreamAttempt(antiBody, apiKey) {
+  return new Promise(function (resolve, reject) {
+    const st = newStreamState(antiBody.model || "probe");
+    const collect = { raw: "", frames: 0 };
+    let settled = false;
+    function settle(v) { if (!settled) { settled = true; resolve(v); } }
+    function fail(e) { if (!settled) { settled = true; reject(e); } }
+    const upReq = postUpstream(antiBody, apiKey, function (e, req, upRes) {
+      if (e) { fail(e); return; }
+      if (upRes.statusCode < 200 || upRes.statusCode >= 300) {
+        readUpstreamError(upRes, function (err) { fail(err); });
+        return;
+      }
+      pumpSSE(upRes, function (event, data) {
+        if (settled) { return; }
+        if (event === "done") { settle({ st: st, collect: collect }); return; }
+        translateFrame(st, event, data, function (ev) {
+          if (settled) { return; }
+          if (ev.done) { settle({ st: st, collect: collect }); }
+          else if (ev.upstreamError) { fail(new Error("upstream stream error: " + ev.upstreamError)); }
+        });
+      }, function (err) {
+        if (settled) { return; }
+        if (err) { fail(err); return; }
+        settle({ st: st, collect: collect });
+      }, collect);
+    });
+    void upReq;
+  });
+}
+// Replay a complete OpenAI completion as SSE for stream:true clients.
+function sendCompletionAsSSE(res, completion) {
+  setCors(res);
+  res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive" });
+  const choice = (completion.choices && completion.choices[0]) || {};
+  const msg = choice.message || {};
+  const base = { id: completion.id, object: "chat.completion.chunk", created: completion.created, model: completion.model };
+  function chunk(delta, finish) {
+    res.write("data: " + JSON.stringify({
+      id: base.id, object: base.object, created: base.created, model: base.model,
+      choices: [{ index: 0, delta: delta, finish_reason: finish || null }]
+    }) + "\n\n");
+  }
+  chunk({ role: "assistant" }, null);
+  if (typeof msg.content === "string" && msg.content) { chunk({ content: msg.content }, null); }
+  const tcs = msg.tool_calls || [];
+  for (let i = 0; i < tcs.length; i++) {
+    const tc = tcs[i] || {};
+    const fn = tc.function || {};
+    chunk({ tool_calls: [{ index: i, id: tc.id, type: "function", function: { name: fn.name || "unknown", arguments: "" } }] }, null);
+    chunk({ tool_calls: [{ index: i, function: { arguments: fn.arguments || "" } }] }, null);
+  }
+  chunk({}, choice.finish_reason || "stop");
+  res.write("data: [DONE]\n\n");
+  res.end();
 }
 async function handleChatCompletions(req, res) {
   if (!checkProxyAuth(req, res)) { return; }
@@ -623,30 +681,41 @@ async function handleChatCompletions(req, res) {
     sendJson(res, 400, { error: { message: over, type: "context_length_exceeded" } });
     return;
   }
+  const t0 = Date.now();
+  function deliverCompletion(completion) {
+    if (oa.stream) { sendCompletionAsSSE(res, completion); return; }
+    sendJson(res, 200, completion);
+  }
   function upstreamFailed(e) {
     const code = e && e.status === 401 ? 401 : 502;
     sendJson(res, code, { error: { message: String((e && e.message) || e), type: "upstream_error" } });
   }
-  function callUpstream() {
-    return new Promise(function (resolve) {
-      const upReq = postUpstream(antiBody, apiKey, function (e, req, upRes) {
-        if (e) { upstreamFailed(e); resolve(null); return; }
-        if (upRes.statusCode < 200 || upRes.statusCode >= 300) {
-          readUpstreamError(upRes, function (err) { upstreamFailed(err); resolve(null); });
-          return;
-        }
-        resolve({ upReq: req, upRes: upRes });
-      });
-      void upReq;
-    });
-  }
-  if (oa.stream) {
-    const live = await callUpstream();
-    if (live) { pipeStreamToClient(live.upReq, live.upRes, res, model); }
+  // Attempt 1: streaming probe. Fast and Cloudflare-safe, but this gateway
+  // currently streams zero content blocks (empty turn, billed tokens).
+  // Attempt 2 (fallback): full non-streaming request, which returns text.
+  let probe = null;
+  let probeErr = null;
+  try {
+    probe = await collectStreamAttempt(antiBody, apiKey);
+  } catch (e) { probeErr = e; }
+  if (probe && (probe.st.text || probe.st.toolIndex >= 0)) {
+    try {
+      console.log("[chat] mode=stream-hit model=" + model + " textLen=" + probe.st.text.length
+        + " tools=" + (probe.st.toolIndex + 1) + " frames=" + probe.collect.frames + " ms=" + (Date.now() - t0));
+    } catch (logE) {}
+    deliverCompletion(synthesisToCompletion(probe.st, model));
     return;
   }
-  const buffered = await callUpstream();
-  if (buffered) { bufferStreamToCompletion(buffered.upReq, buffered.upRes, res, model); }
+  try {
+    console.log("[chat] mode=fallback model=" + model
+      + " reason=" + (probeErr ? ("streamErr:" + String((probeErr && probeErr.message) || probeErr).slice(0, 120)) : ("empty:" + (probe ? probe.collect.frames : 0) + "frames"))
+      + " ms=" + (Date.now() - t0));
+  } catch (logE) {}
+  let anti = null;
+  try {
+    anti = await upstreamMessages(antiBody, apiKey);
+  } catch (e) { upstreamFailed(e); return; }
+  deliverCompletion(anthropicToOpenAIResponse(anti, model));
 }
 async function handleLegacyCompletions(req, res) {
   if (!checkProxyAuth(req, res)) { return; }
