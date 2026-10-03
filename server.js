@@ -569,6 +569,25 @@ function pickMaxTokens(oa) {
   if (!n || n < 1) { return 1024; }
   return Math.min(n, 128000);
 }
+// The gateway answers short turns with thinking-only (redacted) blocks when
+// thinking is left unset: 0 streamed content frames, billed output tokens,
+// end_turn. So always be explicit. Default disabled; enable only when the
+// client asks via OpenAI-style reasoning signals, mapped to budgets.
+function pickThinking(oa, maxTokens) {
+  let effort = null;
+  if (oa.reasoning && typeof oa.reasoning.effort === "string") { effort = oa.reasoning.effort; }
+  else if (typeof oa.reasoning_effort === "string") { effort = oa.reasoning_effort; }
+  else if (oa.reasoning && oa.reasoning.enabled === false) { return { type: "disabled" }; }
+  if (!effort) { return { type: "disabled" }; }
+  const e = String(effort).toLowerCase();
+  let budget = 0;
+  if (e === "high" || e === "xhigh") { budget = 10000; }
+  else if (e === "medium") { budget = 5000; }
+  else if (e === "low" || e === "minimal") { budget = 1024; }
+  else { return { type: "disabled" }; }
+  if (maxTokens <= budget + 256) { return { type: "disabled" }; }
+  return { type: "enabled", budget_tokens: budget };
+}
 async function handleChatCompletions(req, res) {
   if (!checkProxyAuth(req, res)) { return; }
   const apiKey = resolveUpstreamKey(req);
@@ -592,8 +611,13 @@ async function handleChatCompletions(req, res) {
   if (tools) { antiBody.tools = tools; }
   const toolChoice = convertToolChoiceToAnthropic(oa.tool_choice);
   if (toolChoice) { antiBody.tool_choice = toolChoice; }
-  if (typeof oa.temperature === "number") { antiBody.temperature = oa.temperature; }
-  if (typeof oa.top_p === "number") { antiBody.top_p = oa.top_p; }
+  const thinking = pickThinking(oa, antiBody.max_tokens);
+  antiBody.thinking = thinking;
+  // Anthropic rejects temperature/top_p alongside enabled thinking.
+  if (thinking.type !== "enabled") {
+    if (typeof oa.temperature === "number") { antiBody.temperature = oa.temperature; }
+    if (typeof oa.top_p === "number") { antiBody.top_p = oa.top_p; }
+  }
   const over = checkContext(antiBody, antiBody.max_tokens);
   if (over) {
     sendJson(res, 400, { error: { message: over, type: "context_length_exceeded" } });
@@ -644,6 +668,7 @@ async function handleLegacyCompletions(req, res) {
   const suffix = oa.suffix || "";
   const full = suffix ? (String(prompt) + String(suffix)) : String(prompt);
   const antiBody = { model: model, max_tokens: pickMaxTokens(oa), messages: [{ role: "user", content: full || "complete the code" }] };
+  antiBody.thinking = { type: "disabled" };
   if (typeof oa.temperature === "number") { antiBody.temperature = oa.temperature; }
   const overLegacy = checkContext(antiBody, antiBody.max_tokens);
   if (overLegacy) {
