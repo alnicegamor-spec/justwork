@@ -765,6 +765,7 @@ async function handleChatCompletions(req, res) {
   if (toolChoice) { antiBody.tool_choice = toolChoice; }
   const thinking = pickThinking(oa, antiBody.max_tokens);
   antiBody.thinking = thinking;
+  const reqTools = tools ? tools.length : 0;
   // Anthropic rejects temperature/top_p alongside enabled thinking.
   if (thinking.type !== "enabled") {
     if (typeof oa.temperature === "number") { antiBody.temperature = oa.temperature; }
@@ -802,7 +803,7 @@ async function handleChatCompletions(req, res) {
     try {
       console.log("[chat] mode=stream-hit model=" + model + " textLen=" + probe.st.text.length
         + " tools=" + (probe.st.toolIndex + 1) + " frames=" + probe.collect.frames + " ms=" + (Date.now() - t0)
-        + " " + imgSummary(antiBody.messages));
+        + " " + imgSummary(antiBody.messages) + " reqTools=" + reqTools);
     } catch (logE) {}
     deliverCompletion(synthesisToCompletion(probe.st, model));
     return;
@@ -810,7 +811,7 @@ async function handleChatCompletions(req, res) {
   try {
     console.log("[chat] mode=fallback model=" + model
       + " reason=" + (probeErr ? ("streamErr:" + String((probeErr && probeErr.message) || probeErr).slice(0, 120)) : ("empty:" + (probe ? probe.collect.frames : 0) + "frames"))
-      + " ms=" + (Date.now() - t0) + " " + imgSummary(antiBody.messages));
+      + " ms=" + (Date.now() - t0) + " " + imgSummary(antiBody.messages) + " reqTools=" + reqTools);
   } catch (logE) {}
   let anti = null;
   try {
