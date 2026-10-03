@@ -15,6 +15,7 @@ const UPSTREAM_PROTO = process.env.UPSTREAM_PROTO || "https";
 const UPSTREAM_PORT = parseInt(process.env.UPSTREAM_PORT || "443", 10);
 const BODY_LIMIT = parseInt(process.env.BODY_LIMIT_BYTES || "26214400", 10);
 const UPSTREAM_TIMEOUT_MS = parseInt(process.env.UPSTREAM_TIMEOUT_MS || "300000", 10);
+const DEBUG_SSE = process.env.DEBUG_SSE === "1";
 // Model context numbers, env-overridable. Verified 2026-10-01 against
 // https://api.justwoker.icu/v1 (New-API style gateway, /v1/models needs auth):
 // max_tokens up to 128000 accepted, and the gateway reports ~6600 input
@@ -388,7 +389,7 @@ function translateFrame(st, event, data, sink) {
     return;
   }
 }
-function pumpSSE(upRes, onFrame, onEnd) {
+function pumpSSE(upRes, onFrame, onEnd, collect) {
   let buf = "";
   let finished = false;
   function end(e) { if (!finished) { finished = true; onEnd(e); } }
@@ -412,7 +413,12 @@ function pumpSSE(upRes, onFrame, onEnd) {
     }
   }
   upRes.on("data", function (c) {
-    buf += c.toString("utf8").replace(/\r\n/g, "\n");
+    const s = c.toString("utf8");
+    if (collect) {
+      collect.frames++;
+      if (DEBUG_SSE && collect.raw.length < 2000) { collect.raw += s.slice(0, 2000 - collect.raw.length); }
+    }
+    buf += s.replace(/\r\n/g, "\n");
     let idx;
     while ((idx = buf.indexOf("\n\n")) >= 0) {
       const frame = buf.slice(0, idx);
@@ -457,28 +463,47 @@ function pipeStreamToClient(upReq, upRes, clientRes, model) {
     } catch (e) {}
     try { clientRes.end(); } catch (e) {}
   }
+  const t0 = Date.now();
+  const collect = { raw: "", frames: 0 };
+  function finishEmptyChecked() {
+    if (!st.text && st.toolIndex < 0) {
+      ensureRole();
+      emit({ content: "upstream returned empty completion (" + collect.frames + " SSE frames, 0 text; stop=" + String(st.stopReason) + ")" }, null);
+    }
+    finish(anthropicFinish(st));
+  }
+  function logChat(mode) {
+    try {
+      console.log("[chat] mode=" + mode + " model=" + model + " textLen=" + st.text.length
+        + " tools=" + (st.toolIndex + 1) + " stop=" + String(st.stopReason)
+        + " inTok=" + st.inputTokens + " outTok=" + st.outputTokens
+        + " frames=" + collect.frames + " ms=" + (Date.now() - t0)
+        + (collect.raw ? " sample=" + JSON.stringify(collect.raw.slice(0, 600)) : ""));
+    } catch (logE) {}
+  }
   clientRes.on("close", function () { ended = true; try { upReq.destroy(); } catch (e) {} });
   pumpSSE(upRes, function (event, data) {
     if (ended) { return; }
-    if (event === "done") { finish(anthropicFinish(st)); return; }
+    if (event === "done") { logChat("stream"); finishEmptyChecked(); return; }
     translateFrame(st, event, data, function (ev) {
       if (ended) { return; }
       if (ev.role) { ensureRole(); }
       else if (ev.text !== undefined) { ensureRole(); emit({ content: ev.text }, null); }
       else if (ev.toolStart) { ensureRole(); emit({ tool_calls: [{ index: ev.toolStart.index, id: ev.toolStart.id, type: "function", function: { name: ev.toolStart.name, arguments: "" } }] }, null); }
       else if (ev.toolArgs) { emit({ tool_calls: [{ index: ev.toolArgs.index, function: { arguments: ev.toolArgs.partial } }] }, null); }
-      else if (ev.done) { finish(anthropicFinish(st)); }
-      else if (ev.upstreamError) { ensureRole(); emit({ content: "upstream stream error: " + ev.upstreamError }, null); finish("stop"); }
+      else if (ev.done) { logChat("stream"); finishEmptyChecked(); }
+      else if (ev.upstreamError) { logChat("stream-error"); ensureRole(); emit({ content: "upstream stream error: " + ev.upstreamError }, null); finish("stop"); }
     });
   }, function (err) {
     if (ended) { return; }
     if (err) { ensureRole(); emit({ content: "upstream stream error: " + String((err && err.message) || err) }, null); }
     else if (!st.text && st.toolIndex < 0) {
       ensureRole();
-      emit({ content: "upstream returned empty completion (0 text frames parsed; stop=" + String(st.stopReason) + ")" }, null);
+      emit({ content: "upstream returned empty completion (" + collect.frames + " SSE frames, 0 text; stop=" + String(st.stopReason) + ")" }, null);
     }
+    logChat("stream");
     finish(anthropicFinish(st));
-  });
+  }, collect);
 }
 function synthesisToCompletion(st, model) {
   const blocks = [];
@@ -498,15 +523,28 @@ function synthesisToCompletion(st, model) {
 function bufferStreamToCompletion(upReq, upRes, clientRes, model) {
   const st = newStreamState(model);
   let called = false;
+  const t0 = Date.now();
+  const collect = { raw: "", frames: 0 };
+  function logChat() {
+    try {
+      console.log("[chat] mode=buffered model=" + model + " textLen=" + st.text.length
+        + " tools=" + (st.toolIndex + 1) + " stop=" + String(st.stopReason)
+        + " inTok=" + st.inputTokens + " outTok=" + st.outputTokens
+        + " frames=" + collect.frames + " ms=" + (Date.now() - t0)
+        + (collect.raw ? " sample=" + JSON.stringify(collect.raw.slice(0, 600)) : ""));
+    } catch (logE) {}
+  }
   function done(e, completion) {
     if (called) { return; }
     called = true;
-    if (e) { sendJson(clientRes, 502, { error: { message: String((e && e.message) || e), type: "upstream_error" } }); return; }
+    if (e) { logChat(); sendJson(clientRes, 502, { error: { message: String((e && e.message) || e), type: "upstream_error" } }); return; }
     const msg = completion && completion.choices && completion.choices[0] && completion.choices[0].message;
     if ((!msg || !msg.content) && !(msg && msg.tool_calls)) {
+      logChat();
       sendJson(clientRes, 502, { error: { message: "upstream returned empty completion (0 text frames parsed; stop=" + String(st.stopReason) + ")", type: "upstream_error" } });
       return;
     }
+    logChat();
     sendJson(clientRes, 200, completion);
   }
   clientRes.on("close", function () { called = true; try { upReq.destroy(); } catch (e) {} });
@@ -522,8 +560,8 @@ function bufferStreamToCompletion(upReq, upRes, clientRes, model) {
     if (called) { return; }
     if (err) { done(err); return; }
     if (st.text || st.toolIndex >= 0) { done(null, synthesisToCompletion(st, model)); }
-    else { done(new Error("upstream closed stream with no content")); }
-  });
+    else { done(new Error("upstream closed stream with no content (" + collect.frames + " SSE frames)")); }
+  }, collect);
 }
 function pickMaxTokens(oa) {
   const v = oa.max_tokens || oa.max_completion_tokens || 1024;
