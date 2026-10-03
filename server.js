@@ -722,6 +722,24 @@ function sendCompletionAsSSE(res, completion) {
   res.write("data: [DONE]\n\n");
   res.end();
 }
+function imgSummary(messages) {
+  let n = 0; let bytes = 0;
+  try {
+    const list = Array.isArray(messages) ? messages : [];
+    for (const m of list) {
+      const c = m && m.content;
+      if (!Array.isArray(c)) { continue; }
+      for (const b of c) {
+        if (b && b.type === "image" && b.source) {
+          n++;
+          if (b.source.type === "base64" && typeof b.source.data === "string") { bytes += b.source.data.length; }
+          else if (b.source.type === "url") { bytes += String(b.source.url || "").length; }
+        }
+      }
+    }
+  } catch (e) {}
+  return n === 0 ? "images=0" : ("images=" + n + "~" + Math.round(bytes / 1024) + "KB");
+}
 async function handleChatCompletions(req, res) {
   if (!checkProxyAuth(req, res)) { return; }
   const apiKey = resolveUpstreamKey(req);
@@ -783,7 +801,8 @@ async function handleChatCompletions(req, res) {
   if (probe && (probe.st.text || probe.st.toolIndex >= 0)) {
     try {
       console.log("[chat] mode=stream-hit model=" + model + " textLen=" + probe.st.text.length
-        + " tools=" + (probe.st.toolIndex + 1) + " frames=" + probe.collect.frames + " ms=" + (Date.now() - t0));
+        + " tools=" + (probe.st.toolIndex + 1) + " frames=" + probe.collect.frames + " ms=" + (Date.now() - t0)
+        + " " + imgSummary(antiBody.messages));
     } catch (logE) {}
     deliverCompletion(synthesisToCompletion(probe.st, model));
     return;
@@ -791,7 +810,7 @@ async function handleChatCompletions(req, res) {
   try {
     console.log("[chat] mode=fallback model=" + model
       + " reason=" + (probeErr ? ("streamErr:" + String((probeErr && probeErr.message) || probeErr).slice(0, 120)) : ("empty:" + (probe ? probe.collect.frames : 0) + "frames"))
-      + " ms=" + (Date.now() - t0));
+      + " ms=" + (Date.now() - t0) + " " + imgSummary(antiBody.messages));
   } catch (logE) {}
   let anti = null;
   try {
