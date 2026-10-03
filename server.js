@@ -233,6 +233,57 @@ function upstreamMessages(antiBody, apiKey, retried) {
 // ~4 chars per token heuristic plus the measured gateway overhead.
 // Used to fail fast with a clear 400 instead of a 120s+ "upstream timeout"
 // followed by full-payload retries.
+function fetchImageAsBase64(url, redirects) {
+  return new Promise(function (resolve, reject) {
+    if (redirects === undefined) { redirects = 3; }
+    const transport = url.indexOf("http://") === 0 ? http : https;
+    let req = null;
+    try {
+      req = transport.get(url, { timeout: 25000 }, function (upRes) {
+        if (upRes.statusCode >= 300 && upRes.statusCode < 400 && upRes.headers.location && redirects > 0) {
+          upRes.resume();
+          fetchImageAsBase64(upRes.headers.location, redirects - 1).then(resolve, reject);
+          return;
+        }
+        if (upRes.statusCode < 200 || upRes.statusCode >= 300) {
+          reject(new Error("image fetch HTTP " + upRes.statusCode));
+          upRes.resume();
+          return;
+        }
+        const chunks = [];
+        let size = 0;
+        upRes.on("data", function (c) {
+          size += c.length;
+          if (size > 8388608) { reject(new Error("image larger than 8MB")); try { req.destroy(); } catch (e) {} return; }
+          chunks.push(c);
+        });
+        upRes.on("end", function () {
+          const buf = Buffer.concat(chunks);
+          if (!buf.length) { reject(new Error("image body empty")); return; }
+          const ct = String((upRes.headers && upRes.headers["content-type"]) || "image/png").split(";")[0].trim().toLowerCase();
+          resolve({ mime: ct.indexOf("image/") === 0 ? ct : "image/png", data: buf.toString("base64") });
+        });
+        upRes.on("error", reject);
+      });
+    } catch (e) { reject(e); return; }
+    req.on("error", reject);
+    req.on("timeout", function () { try { req.destroy(); } catch (e) {} reject(new Error("image fetch timed out")); });
+  });
+}
+async function inlineUrlImages(messages) {
+  const list = Array.isArray(messages) ? messages : [];
+  for (const m of list) {
+    const content = m && m.content;
+    if (!Array.isArray(content)) { continue; }
+    for (let i = 0; i < content.length; i++) {
+      const b = content[i];
+      if (b && b.type === "image" && b.source && b.source.type === "url" && b.source.url) {
+        const img = await fetchImageAsBase64(b.source.url);
+        content[i] = { type: "image", source: { type: "base64", media_type: img.mime, data: img.data } };
+      }
+    }
+  }
+}
 function estimateInputTokens(antiBody) {
   let chars = 0;
   let images = 0;
@@ -700,6 +751,12 @@ async function handleChatCompletions(req, res) {
   if (thinking.type !== "enabled") {
     if (typeof oa.temperature === "number") { antiBody.temperature = oa.temperature; }
     if (typeof oa.top_p === "number") { antiBody.top_p = oa.top_p; }
+  }
+  try {
+    await inlineUrlImages(antiBody.messages);
+  } catch (e) {
+    sendJson(res, 400, { error: { message: "cannot fetch attached image URL: " + String((e && e.message) || e), type: "invalid_request" } });
+    return;
   }
   const over = checkContext(antiBody, antiBody.max_tokens);
   if (over) {
