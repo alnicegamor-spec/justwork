@@ -706,6 +706,68 @@ function collectStreamAttempt(antiBody, apiKey) {
     void upReq;
   });
 }
+// The gateway re-describes tool schemas with its own canonical names (proven:
+// schema sent with `path` comes back answered as `file_path`). OpenCode then
+// rejects the call because ITS schema wants `path`. Repair each tool_call's
+// args against the ORIGINAL client schemas: fill any missing schema property
+// from a present alias key (normalized or well-known), never clobbering.
+const ARG_ALIASES = {
+  path: ["file_path", "filepath", "filename", "file", "pathname"],
+  old_string: ["oldstring", "old_text", "oldtext"],
+  new_string: ["newstring", "new_text", "newtext"]
+};
+function normKey(k) { return String(k).toLowerCase().replace(/[_-]/g, ""); }
+function repairToolArgs(toolName, argsObj, oaTools) {
+  if (!argsObj || typeof argsObj !== "object" || Array.isArray(argsObj)) { return 0; }
+  let def = null;
+  if (Array.isArray(oaTools)) {
+    for (const t of oaTools) {
+      if (t && t.type === "function" && t.function && t.function.name === toolName) { def = t.function; break; }
+    }
+  }
+  const props = (def && def.parameters && def.parameters.properties) || {};
+  const propNames = Object.keys(props);
+  if (propNames.length === 0) { return 0; }
+  let fixed = 0;
+  for (const prop of propNames) {
+    if (argsObj[prop] !== undefined) { continue; }
+    const argKeys = Object.keys(argsObj);
+    let src = null;
+    for (const k of argKeys) {
+      if (normKey(k) === normKey(prop)) { src = k; break; }
+    }
+    if (!src) {
+      const aliases = ARG_ALIASES[prop] || [];
+      for (const k of argKeys) {
+        if (aliases.indexOf(normKey(k)) >= 0) { src = k; break; }
+      }
+    }
+    if (src && src !== prop) {
+      argsObj[prop] = argsObj[src];
+      delete argsObj[src];
+      fixed++;
+      try { console.log("[args] tool=" + toolName + " " + src + "->" + prop); } catch (e) {}
+    }
+  }
+  return fixed;
+}
+function repairCompletionToolCalls(completion, oaTools) {
+  try {
+    const choice = completion && completion.choices && completion.choices[0];
+    const msg = choice && choice.message;
+    const tcs = msg && msg.tool_calls;
+    if (!Array.isArray(tcs)) { return; }
+    for (const tc of tcs) {
+      const fn = tc && tc.function;
+      if (!fn || typeof fn.arguments !== "string") { continue; }
+      let args = null;
+      try { args = JSON.parse(fn.arguments); } catch (e) { continue; }
+      if (repairToolArgs(fn.name, args, oaTools) > 0) {
+        fn.arguments = JSON.stringify(args);
+      }
+    }
+  } catch (e) {}
+}
 // Replay a complete OpenAI completion as SSE for stream:true clients.
 function sendCompletionAsSSE(res, completion) {
   setCors(res);
@@ -794,6 +856,7 @@ async function handleChatCompletions(req, res) {
   }
   const t0 = Date.now();
   function deliverCompletion(completion) {
+    repairCompletionToolCalls(completion, oa.tools);
     if (oa.stream) { sendCompletionAsSSE(res, completion); return; }
     sendJson(res, 200, completion);
   }
