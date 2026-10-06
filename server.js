@@ -19,6 +19,13 @@ const UPSTREAM_TIMEOUT_MS = parseInt(process.env.UPSTREAM_TIMEOUT_MS || "300000"
 // kills the connection at ~120s (observed 524s). Cap below that for a clean
 // error instead of an edge kill.
 const NONSTREAM_TIMEOUT_MS = parseInt(process.env.NONSTREAM_TIMEOUT_MS || "115000", 10);
+// Continuation chunking: a single generation longer than ~120s dies at the
+// Cloudflare edge. Split it into per-chunk budgets that each fit, chaining
+// via assistant prefill. Tool turns return immediately (the client loop
+// continues after executing tools); pure-text max_tokens cutoffs continue
+// server-side. Capped so a runaway still terminates.
+const CHUNK_TOKENS = parseInt(process.env.CHUNK_TOKENS || "3500", 10);
+const MAX_CHUNKS = 8;
 // Reused keep-alive agents: skip a fresh TLS handshake (~200-500ms) on every
 // upstream request instead of connecting from scratch each time.
 const keepAliveHttps = new https.Agent({ keepAlive: true, maxSockets: 8 });
@@ -812,6 +819,39 @@ function imgSummary(messages) {
   } catch (e) {}
   return n === 0 ? "images=0" : ("images=" + n + "~" + Math.round(bytes / 1024) + "KB");
 }
+// Continuation assembly for the ~120s edge ceiling. One client turn becomes
+// up to MAX_CHUNKS sequential upstream calls, each budgeted to fit inside the
+// window, chained by prefilling the accumulated text as an assistant message.
+// Turns that produce tool calls return immediately (the client executes the
+// tools and continues next turn). Usage is summed across chunks.
+async function fetchCompleteText(antiBody, apiKey, baseMsgs) {
+  let textOut = "";
+  const toolBlocks = [];
+  let inT = 0, outT = 0, stop = null, chunks = 0;
+  let remaining = antiBody.max_tokens;
+  let prefill = "";
+  while (chunks < MAX_CHUNKS && remaining > 0) {
+    const budget = Math.min(CHUNK_TOKENS, Math.max(remaining, 256));
+    const msgs = prefill ? baseMsgs.concat([{ role: "assistant", content: prefill }]) : baseMsgs;
+    const attempt = Object.assign({}, antiBody, { max_tokens: budget, messages: msgs });
+    const anti = await upstreamMessages(attempt, apiKey, false, NONSTREAM_TIMEOUT_MS);
+    chunks++;
+    const u = anti.usage || {};
+    inT += u.input_tokens || 0;
+    outT += u.output_tokens || 0;
+    stop = anti.stop_reason;
+    let sawTool = false;
+    for (const blk of (anti.content || [])) {
+      if (!blk) { continue; }
+      if (blk.type === "text" && blk.text) { textOut += blk.text; }
+      else if (blk.type === "tool_use") { toolBlocks.push(blk); sawTool = true; }
+    }
+    remaining = antiBody.max_tokens - outT;
+    if (sawTool || stop !== "max_tokens" || remaining <= 0) { break; }
+    prefill = textOut;
+  }
+  return { textOut: textOut, toolBlocks: toolBlocks, stop: stop, inT: inT, outT: outT, chunks: chunks };
+}
 async function handleChatCompletions(req, res) {
   if (!checkProxyAuth(req, res)) { return; }
   const apiKey = resolveUpstreamKey(req);
@@ -868,20 +908,43 @@ async function handleChatCompletions(req, res) {
     }
     sendJson(res, code, { error: { message: detail, type: "upstream_error" } });
   }
-  // Single non-streaming attempt. The gateway's streaming path bills tokens
-  // but yields zero content blocks, so a streaming-first probe only added
-  // latency and double billing. Slow generations can still hit the ~120s
-  // edge cap and fail here with a clear message.
-  let anti = null;
+  // Thinking-enabled turns go single-shot (thinking blocks cannot be
+  // prefilled safely). Everything else chains through fetchCompleteText, which
+  // is a single call whenever the answer fits in one chunk budget.
   const t1 = Date.now();
+  let completion = null;
+  if (thinking.type === "enabled") {
+    let anti = null;
+    try {
+      anti = await upstreamMessages(antiBody, apiKey, false, NONSTREAM_TIMEOUT_MS);
+    } catch (e) { upstreamFailed(e); return; }
+    completion = anthropicToOpenAIResponse(anti, model);
+  } else {
+    let r = null;
+    try {
+      r = await fetchCompleteText(antiBody, apiKey, antiBody.messages);
+    } catch (e) { upstreamFailed(e); return; }
+    const blocks = [];
+    if (r.textOut) { blocks.push({ type: "text", text: r.textOut }); }
+    for (const t of r.toolBlocks) { blocks.push(t); }
+    completion = anthropicToOpenAIResponse({
+      content: blocks,
+      stop_reason: r.stop || (r.toolBlocks.length > 0 ? "tool_use" : "end_turn"),
+      usage: { input_tokens: r.inT, output_tokens: r.outT }
+    }, model);
+    try {
+      console.log("[chat] mode=direct model=" + model + " inTok=" + r.inT
+        + " outTok=" + r.outT + " ms=" + (Date.now() - t1) + " chunks=" + r.chunks
+        + " stop=" + String(r.stop)
+        + " " + imgSummary(antiBody.messages) + " reqTools=" + reqTools);
+    } catch (logE) {}
+    deliverCompletion(completion);
+    return;
+  }
   try {
-    anti = await upstreamMessages(antiBody, apiKey, false, NONSTREAM_TIMEOUT_MS);
-  } catch (e) { upstreamFailed(e); return; }
-  const completion = anthropicToOpenAIResponse(anti, model);
-  try {
-    const u = (anti && anti.usage) || {};
-    console.log("[chat] mode=direct model=" + model + " inTok=" + (u.input_tokens || 0)
-      + " outTok=" + (u.output_tokens || 0) + " ms=" + (Date.now() - t1)
+    const u = (completion && completion.usage) || {};
+    console.log("[chat] mode=direct model=" + model + " inTok=" + (u.prompt_tokens || 0)
+      + " outTok=" + (u.completion_tokens || 0) + " ms=" + (Date.now() - t1)
       + " " + imgSummary(antiBody.messages) + " reqTools=" + reqTools);
   } catch (logE) {}
   deliverCompletion(completion);
