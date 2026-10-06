@@ -824,13 +824,18 @@ function imgSummary(messages) {
 // window, chained by prefilling the accumulated text as an assistant message.
 // Turns that produce tool calls return immediately (the client executes the
 // tools and continues next turn). Usage is summed across chunks.
-async function fetchCompleteText(antiBody, apiKey, baseMsgs) {
+async function fetchCompleteText(antiBody, apiKey, baseMsgs, clientRes) {
   let textOut = "";
   const toolBlocks = [];
   let inT = 0, outT = 0, stop = null, chunks = 0;
   let remaining = antiBody.max_tokens;
   let prefill = "";
   while (chunks < MAX_CHUNKS && remaining > 0) {
+    if (clientRes && clientRes.destroyed) {
+      const gone = new Error("client gone");
+      gone.aborted = true;
+      throw gone;
+    }
     const budget = Math.min(CHUNK_TOKENS, Math.max(remaining, 256));
     const msgs = prefill ? baseMsgs.concat([{ role: "assistant", content: prefill }]) : baseMsgs;
     const attempt = Object.assign({}, antiBody, { max_tokens: budget, messages: msgs });
@@ -896,9 +901,11 @@ async function handleChatCompletions(req, res) {
   }
   const t0 = Date.now();
   function deliverCompletion(completion) {
-    repairCompletionToolCalls(completion, oa.tools);
-    if (oa.stream) { sendCompletionAsSSE(res, completion); return; }
-    sendJson(res, 200, completion);
+    try {
+      repairCompletionToolCalls(completion, oa.tools);
+      if (oa.stream) { sendCompletionAsSSE(res, completion); return; }
+      sendJson(res, 200, completion);
+    } catch (e) {}
   }
   function upstreamFailed(e) {
     const code = e && e.status === 401 ? 401 : 502;
@@ -922,8 +929,12 @@ async function handleChatCompletions(req, res) {
   } else {
     let r = null;
     try {
-      r = await fetchCompleteText(antiBody, apiKey, antiBody.messages);
-    } catch (e) { upstreamFailed(e); return; }
+      r = await fetchCompleteText(antiBody, apiKey, antiBody.messages, res);
+    } catch (e) {
+      if (e && e.aborted) { return; }
+      upstreamFailed(e);
+      return;
+    }
     const blocks = [];
     if (r.textOut) { blocks.push({ type: "text", text: r.textOut }); }
     for (const t of r.toolBlocks) { blocks.push(t); }
@@ -1016,8 +1027,15 @@ function handleModels(req, res) {
 function handleHealth(req, res) {
   sendJson(res, 200, { ok: true, upstream: UPSTREAM_HOST + UPSTREAM_PATH, models: MODELS.map(function (m) { return m.id; }), auth: PROXY_TOKEN ? "token" : "open", version: process.env.RENDER_GIT_COMMIT || "local", time: new Date().toISOString() });
 }
-const server = http.createServer(function (req, res) {
-  if (req.method === "OPTIONS") { setCors(res); res.writeHead(204); res.end(); return; }
+// Never die on a stray exception (a crash = "Cannot connect" client-side,
+// plus a 50s+ cold start on the free tier while the instance reboots).
+process.on("uncaughtException", function (e) {
+  try { console.error("[fatal] uncaught:", (e && e.message) || e); } catch (_) {}
+});
+process.on("unhandledRejection", function (e) {
+  try { console.error("[fatal] unhandled:", (e && e.message) || e); } catch (_) {}
+});
+const server = http.createServer(function (req, res) {  if (req.method === "OPTIONS") { setCors(res); res.writeHead(204); res.end(); return; }
   const url = (req.url || "/").split("?")[0];
   if (req.method === "GET" && (url === "/health" || url === "/")) { handleHealth(req, res); return; }
   if (req.method === "GET" && url === "/v1/models") { handleModels(req, res); return; }
