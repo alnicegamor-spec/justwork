@@ -31,13 +31,18 @@ const MAX_CHUNKS = 8;
 const keepAliveHttps = new https.Agent({ keepAlive: true, maxSockets: 8 });
 const keepAliveHttp = new http.Agent({ keepAlive: true, maxSockets: 8 });
 const DEBUG_SSE = process.env.DEBUG_SSE === "1";
-// Model context numbers, env-overridable. Verified 2026-10-01 against
-// https://api.justwoker.icu/v1 (New-API style gateway, /v1/models needs auth):
-// max_tokens up to 128000 accepted, and the gateway reports ~6600 input
-// tokens on a 6-word prompt, i.e. a fixed ~6.6k-token overhead per request.
-// MODEL_OVERHEAD reserves that (rounded up) so guarded/advertised limits
-// reflect usable context, not the raw upstream window.
-const MODEL_CONTEXT = parseInt(process.env.MODEL_CONTEXT || "200000", 10);
+// Model context numbers, env-overridable. Re-verified 2026-10-10 against
+// https://api.justwoker.icu/v1 (Anthropic /v1/messages with a live key):
+// /v1/models lists only claude-opus-4-8 (endpoints: anthropic + openai) with
+// no context field, so the window was measured empirically with sized filler
+// prompts (17 tokens per "the quick brown fox..." repeat): 998K input + 16
+// max_tokens ACCEPTED, 1,000,000 + 16 REJECTED with "Context window is
+// full" -> a true 1,000,000-token window. A ~998K prefill takes ~54s,
+// inside the ~120s Cloudflare edge budget. The gateway still bills a fixed
+// ~6.6K input tokens on a tiny prompt (6,639 measured), so MODEL_OVERHEAD
+// reserves that (rounded up) so guarded/advertised limits reflect usable
+// context, not the raw upstream window.
+const MODEL_CONTEXT = parseInt(process.env.MODEL_CONTEXT || "1000000", 10);
 const MODEL_OUTPUT = parseInt(process.env.MODEL_OUTPUT || "32000", 10);
 const MODEL_OVERHEAD = parseInt(process.env.MODEL_OVERHEAD || "7000", 10);
 const MODELS = [

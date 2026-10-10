@@ -191,7 +191,7 @@ function printOpenCodeSnippet(url, tokenNote) {
       package: "@opencode/ai/providers/openai-compatible",
       settings: { baseURL: url + "/v1", apiKey: "{env:JDW_PROXY_TOKEN}" },
       models: {
-        "claude-opus-4-8": { name: "claude-opus-4-8", capabilities: { tools: true, input: ["text", "image"], output: ["text"] }, limit: { context: 193000, output: 32000 } }
+        "claude-opus-4-8": { name: "claude-opus-4-8", capabilities: { tools: true, input: ["text", "image"], output: ["text"] }, limit: { context: 993000, output: 32000 } }
       }
     }
   }, null, 2));
