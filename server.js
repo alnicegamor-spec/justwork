@@ -186,10 +186,24 @@ function openaiMessagesToAnthropic(oaMessages) {
     // surface a clear error rather than inventing an unmatched id.
     return origId || nextId("toolu_");
   }
+  // Anthropic/Bedrock requires that ALL tool_result blocks answering one
+  // assistant turn live in a SINGLE user message. OpenAI clients (OpenCode)
+  // send one tool message per result, so parallel tool calls arrive as several
+  // consecutive tool messages. Emitting each as its own user message yields
+  // "Invalid tool use format" (REQUEST_BODY_INVALID -> gateway 502). Buffer
+  // consecutive tool results and flush them as one user message.
+  let toolResultBuffer = [];
+  function flushToolResults() {
+    if (toolResultBuffer.length > 0) {
+      messages.push({ role: "user", content: toolResultBuffer });
+      toolResultBuffer = [];
+    }
+  }
   for (const m of list) {
     if (!m || typeof m !== "object") { continue; }
     const role = m.role || "user";
     if (role === "system") {
+      flushToolResults();
       const c = convertContentToAnthropic(m.content);
       if (typeof c === "string" && c) { systemParts.push(c); }
       else if (Array.isArray(c)) {
@@ -200,12 +214,11 @@ function openaiMessagesToAnthropic(oaMessages) {
     if (role === "tool") {
       const toolId = matchToolResultId(m.tool_call_id || m.id || "");
       const text = typeof m.content === "string" ? m.content : JSON.stringify(m.content);
-      messages.push({
-        role: "user",
-        content: [{ type: "tool_result", tool_use_id: toolId, content: text }]
-      });
+      toolResultBuffer.push({ type: "tool_result", tool_use_id: toolId, content: text });
       continue;
     }
+    // Any non-tool message ends the current run of tool results.
+    flushToolResults();
     if (role === "assistant" && Array.isArray(m.tool_calls) && m.tool_calls.length > 0) {
       const blocks = [];
       const tcText = typeof m.content === "string" ? m.content : "";
@@ -224,8 +237,24 @@ function openaiMessagesToAnthropic(oaMessages) {
     const outRole = role === "assistant" ? "assistant" : "user";
     messages.push({ role: outRole, content: content });
   }
+  flushToolResults();
   if (systemParts.length > 0) { system = systemParts.join("\n\n"); }
-  return { system: system, messages: messages };
+  // Anthropic requires strictly alternating user/assistant roles. OpenCode can
+  // emit consecutive assistant messages (a text-only turn followed by a
+  // tool_use turn) or consecutive user messages. Merge same-role neighbours by
+  // concatenating their content blocks so the final transcript alternates.
+  const merged = [];
+  for (const msg of messages) {
+    const last = merged[merged.length - 1];
+    if (last && last.role === msg.role) {
+      const a = Array.isArray(last.content) ? last.content.slice() : (last.content ? [{ type: "text", text: last.content }] : []);
+      const b = Array.isArray(msg.content) ? msg.content : (msg.content ? [{ type: "text", text: msg.content }] : []);
+      last.content = a.concat(b);
+      continue;
+    }
+    merged.push({ role: msg.role, content: msg.content });
+  }
+  return { system: system, messages: merged };
 }
 function upstreamMessages(antiBody, apiKey, retried, timeoutMs) {
   return new Promise(function (resolve, reject) {
