@@ -920,17 +920,22 @@ async function handleChatCompletions(req, res) {
     }
     sendJson(res, code, { error: { message: detail, type: "upstream_error" } });
   }
-  // Thinking-enabled turns go single-shot (thinking blocks cannot be
-  // prefilled safely). Everything else chains through fetchCompleteText, which
+  // Thinking-enabled turns cannot be chunked (thinking blocks cannot be
+  // prefilled safely across continuation calls), so they go single-shot. But a
+  // single non-streaming call dies at the ~120s Cloudflare edge, which is what
+  // caused reasoning turns over screenshots to 502. Stream the upstream call
+  // instead: continuous bytes (message_start, deltas, pings) keep the edge
+  // connection alive past 120s, and we collect the whole stream server-side
+  // before replying. Everything else chains through fetchCompleteText, which
   // is a single call whenever the answer fits in one chunk budget.
   const t1 = Date.now();
   let completion = null;
   if (thinking.type === "enabled") {
-    let anti = null;
+    let attempt = null;
     try {
-      anti = await upstreamMessages(antiBody, apiKey, false, NONSTREAM_TIMEOUT_MS);
+      attempt = await collectStreamAttempt(antiBody, apiKey);
     } catch (e) { upstreamFailed(e); return; }
-    completion = anthropicToOpenAIResponse(anti, model);
+    completion = synthesisToCompletion(attempt.st, model);
   } else {
     let r = null;
     try {
