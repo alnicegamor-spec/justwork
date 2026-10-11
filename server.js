@@ -274,6 +274,30 @@ function openaiMessagesToAnthropic(oaMessages) {
   }
   return { system: system, messages: merged };
 }
+// A Cloudflare WAF block returns an HTML "Blocked"/"Attention Required" page
+// with a 403, not JSON. This fires BEFORE the request reaches the backend, so
+// the key and account are fine. It's usually triggered by content in the
+// conversation that matches an attack signature (e.g. a shell command with
+// adb/curl piped to an interpreter) or by an oversized body. Detect it and
+// return a clear, actionable message instead of a raw HTML dump.
+function wafMessage(status, raw) {
+  if (status !== 403) { return null; }
+  const body = String(raw || "");
+  const looksLikeCfBlock =
+    body.indexOf("<!DOCTYPE html>") >= 0 ||
+    body.indexOf("Attention Required") >= 0 ||
+    body.indexOf("<title>Blocked</title>") >= 0 ||
+    body.indexOf("cf-error") >= 0 ||
+    body.indexOf("cloudflare") >= 0;
+  if (!looksLikeCfBlock) { return null; }
+  return "Cloudflare WAF blocked this request (403) before it reached the model. "
+    + "This is not an auth or quota problem. Something in the conversation history "
+    + "tripped a security rule (often a shell command containing patterns like adb/"
+    + "curl piped to an interpreter), or the request body is too large (e.g. many "
+    + "embedded screenshots). Fix: start a fresh session, or remove the offending "
+    + "tool call/output from the history, then retry. The same content will keep "
+    + "failing on every resend until it is removed.";
+}
 function upstreamMessages(antiBody, apiKey, retried, timeoutMs) {
   return new Promise(function (resolve, reject) {
     const payload = JSON.stringify(antiBody);
@@ -294,18 +318,21 @@ function upstreamMessages(antiBody, apiKey, retried, timeoutMs) {
       res.on("data", function (c) { chunks.push(c); });
       res.on("end", function () {
         // Transient gateway edge flakes (observed: empty-body 403 on an
-        // otherwise healthy request). Retry once after a short delay.
-        if ((res.statusCode === 403 || res.statusCode === 429) && !retried) {
+        // otherwise healthy request). Retry once after a short delay. A WAF
+        // block, by contrast, is deterministic for this body: never retry it.
+        const rawEarly = Buffer.concat(chunks).toString("utf8");
+        const wafEarly = wafMessage(res.statusCode, rawEarly);
+        if ((res.statusCode === 403 || res.statusCode === 429) && !retried && !wafEarly) {
           setTimeout(function () {
             upstreamMessages(antiBody, apiKey, true, timeoutMs).then(resolve, reject);
           }, 1500);
           return;
         }
-        const raw = Buffer.concat(chunks).toString("utf8");
+        const raw = rawEarly;
         let parsed = null;
         try { parsed = JSON.parse(raw); } catch (e) { parsed = null; }
         if (res.statusCode < 200 || res.statusCode >= 300) {
-          const msg = (parsed && parsed.error && parsed.error.message) || raw.slice(0, 500);
+          const msg = wafMessage(res.statusCode, raw) || (parsed && parsed.error && parsed.error.message) || raw.slice(0, 500);
           const err = new Error("upstream " + res.statusCode + ": " + msg);
           err.status = res.statusCode;
           reject(err);
@@ -480,7 +507,7 @@ function readUpstreamError(upRes, callback) {
     const raw = Buffer.concat(chunks).toString("utf8");
     let parsed = null;
     try { parsed = JSON.parse(raw); } catch (e) { parsed = null; }
-    const msg = (parsed && parsed.error && (parsed.error.message || JSON.stringify(parsed.error))) || raw.slice(0, 500);
+    const msg = wafMessage(upRes.statusCode, raw) || (parsed && parsed.error && (parsed.error.message || JSON.stringify(parsed.error))) || raw.slice(0, 500);
     const err = new Error("upstream " + upRes.statusCode + ": " + msg);
     err.status = upRes.statusCode;
     callback(err);
@@ -983,11 +1010,14 @@ async function handleChatCompletions(req, res) {
     } catch (e) {}
   }
   function upstreamFailed(e) {
-    const code = e && e.status === 401 ? 401 : 502;
+    let code = e && e.status === 401 ? 401 : 502;
     let detail = String((e && e.message) || e);
     if (e && (e.status === 524 || /upstream timeout/.test(detail))) {
       detail += " Generation exceeded the ~120s Cloudflare window. Split the task, shorten context, wait 120s, then retry.";
     }
+    // Surface a WAF block as a 400 (client must change the request) rather than
+    // a 502 that OpenCode auto-retries forever against the same poisoned body.
+    if (/Cloudflare WAF blocked/.test(detail)) { code = 400; }
     sendJson(res, code, { error: { message: detail, type: "upstream_error" } });
   }
   // Thinking-enabled turns cannot be chunked (thinking blocks cannot be
