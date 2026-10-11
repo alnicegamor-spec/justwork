@@ -921,16 +921,30 @@ async function handleChatCompletions(req, res) {
     sendJson(res, code, { error: { message: detail, type: "upstream_error" } });
   }
   // Thinking-enabled turns cannot be chunked (thinking blocks cannot be
-  // prefilled safely across continuation calls), so they go single-shot. But a
-  // single non-streaming call dies at the ~120s Cloudflare edge, which is what
-  // caused reasoning turns over screenshots to 502. Stream the upstream call
-  // instead: continuous bytes (message_start, deltas, pings) keep the edge
-  // connection alive past 120s, and we collect the whole stream server-side
-  // before replying. Everything else chains through fetchCompleteText, which
-  // is a single call whenever the answer fits in one chunk budget.
+  // prefilled safely across continuation calls), so they go single-shot. Two
+  // Cloudflare edges sit in the path (client->proxy and proxy->upstream), and
+  // each kills a connection that is silent for ~100-120s. Streaming solves
+  // BOTH legs: pipe the upstream SSE straight through to the client so the
+  // first byte reaches the client within seconds and bytes keep flowing. (The
+  // earlier fix streamed only the upstream leg but still buffered the whole
+  // answer before replying, leaving the client leg silent for the full
+  // generation -> client-side 502 on long reasoning turns.) Non-stream clients
+  // (rare) fall back to collect-then-reply. Everything else chains through
+  // fetchCompleteText, a single call whenever the answer fits one chunk budget.
   const t1 = Date.now();
   let completion = null;
   if (thinking.type === "enabled") {
+    if (oa.stream) {
+      postUpstream(antiBody, apiKey, function (e, upReq, upRes) {
+        if (e) { upstreamFailed(e); return; }
+        if (upRes.statusCode < 200 || upRes.statusCode >= 300) {
+          readUpstreamError(upRes, function (err) { upstreamFailed(err); });
+          return;
+        }
+        pipeStreamToClient(upReq, upRes, res, model);
+      });
+      return;
+    }
     let attempt = null;
     try {
       attempt = await collectStreamAttempt(antiBody, apiKey);
