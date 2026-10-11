@@ -135,13 +135,31 @@ function convertContentToAnthropic(openaiContent) {
   if (parts.length === 1 && parts[0].type === "text") { return parts[0].text; }
   return parts;
 }
-function convertToolsToAnthropic(oaTools) {
+// Anthropic/Bedrock tool names must match ^[a-zA-Z0-9_-]{1,64}$. OpenCode sends
+// names like "default.edit" (dots) that the gateway rejects with "Invalid tool
+// use format" (REQUEST_BODY_INVALID -> 502). Replace any invalid char with "_".
+// A name map lets us translate the sanitized name back when the model calls it.
+function sanitizeToolName(name) {
+  let safe = String(name).replace(/[^a-zA-Z0-9_-]/g, "_");
+  if (safe.length === 0) { safe = "tool"; }
+  if (safe.length > 64) { safe = safe.slice(0, 64); }
+  return safe;
+}
+// Translate a sanitized tool name back to the client's original (e.g.
+// "default_edit" -> "default.edit") so the client recognizes its own tool.
+function unmapToolName(name, nameMap) {
+  if (nameMap && Object.prototype.hasOwnProperty.call(nameMap, name)) { return nameMap[name]; }
+  return name;
+}
+function convertToolsToAnthropic(oaTools, nameMap) {
   if (!Array.isArray(oaTools) || oaTools.length === 0) { return undefined; }
   const out = [];
   for (const t of oaTools) {
     if (t && t.type === "function" && t.function && t.function.name) {
+      const safe = sanitizeToolName(t.function.name);
+      if (nameMap && safe !== t.function.name) { nameMap[safe] = t.function.name; }
       out.push({
-        name: t.function.name,
+        name: safe,
         description: t.function.description || "",
         input_schema: t.function.parameters || { type: "object", properties: {} }
       });
@@ -155,7 +173,7 @@ function convertToolChoiceToAnthropic(choice) {
   if (choice === "none") { return { type: "none" }; }
   if (choice === "required") { return { type: "any" }; }
   if (typeof choice === "object" && choice.type === "function" && choice.function && choice.function.name) {
-    return { type: "tool", name: choice.function.name };
+    return { type: "tool", name: sanitizeToolName(choice.function.name) };
   }
   return { type: "auto" };
 }
@@ -228,7 +246,7 @@ function openaiMessagesToAnthropic(oaMessages) {
         let input = {};
         try { input = fn.arguments ? JSON.parse(fn.arguments) : {}; }
         catch (e) { input = { raw: fn.arguments || "" }; }
-        blocks.push({ type: "tool_use", id: freshToolUseId(tc.id), name: fn.name || "unknown", input: input });
+        blocks.push({ type: "tool_use", id: freshToolUseId(tc.id), name: sanitizeToolName(fn.name || "unknown"), input: input });
       }
       messages.push({ role: "assistant", content: blocks });
       continue;
@@ -391,7 +409,7 @@ function anthropicStopToOpenAI(stop) {
   if (stop === "tool_use") { return "tool_calls"; }
   return "stop";
 }
-function anthropicToOpenAIResponse(anti, model) {
+function anthropicToOpenAIResponse(anti, model, nameMap) {
   const blocks = (anti && anti.content) || [];
   let text = "";
   const toolCalls = [];
@@ -401,7 +419,7 @@ function anthropicToOpenAIResponse(anti, model) {
       toolCalls.push({
         id: b.id || nextId("call_"),
         type: "function",
-        function: { name: b.name || "unknown", arguments: JSON.stringify(b.input || {}) }
+        function: { name: unmapToolName(b.name || "unknown", nameMap), arguments: JSON.stringify(b.input || {}) }
       });
     }
   }
@@ -469,11 +487,11 @@ function readUpstreamError(upRes, callback) {
   });
   upRes.on("error", function (e) { callback(e); });
 }
-function newStreamState(model) {
+function newStreamState(model, nameMap) {
   return {
     id: nextId("chatcmpl-"), created: Math.floor(Date.now() / 1000), model: model,
     sentRole: false, toolIndex: -1, toolBlock: {}, stopReason: null,
-    inputTokens: 0, outputTokens: 0, text: "", tools: []
+    inputTokens: 0, outputTokens: 0, text: "", tools: [], nameMap: nameMap || null
   };
 }
 // Sink events: {role} {text} {toolStart:{index,id,name}}
@@ -499,7 +517,7 @@ function translateFrame(st, event, data, sink) {
     if (b.type === "tool_use") {
       st.toolIndex++;
       st.toolBlock[data.index] = st.toolIndex;
-      st.tools[st.toolIndex] = { id: b.id || nextId("call_"), name: b.name || "unknown", args: "" };
+      st.tools[st.toolIndex] = { id: b.id || nextId("call_"), name: unmapToolName(b.name || "unknown", st.nameMap), args: "" };
       sink({ toolStart: { index: st.toolIndex, id: st.tools[st.toolIndex].id, name: st.tools[st.toolIndex].name } });
     }
     return;
@@ -586,10 +604,10 @@ function anthropicFinish(st) {
   if (st.toolIndex >= 0) { return "tool_calls"; }
   return anthropicStopToOpenAI(st.stopReason);
 }
-function pipeStreamToClient(upReq, upRes, clientRes, model) {
+function pipeStreamToClient(upReq, upRes, clientRes, model, nameMap) {
   setCors(clientRes);
   clientRes.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive" });
-  const st = newStreamState(model);
+  const st = newStreamState(model, nameMap);
   let ended = false;
   function emit(delta, finishReason) {
     if (ended) { return; }
@@ -739,9 +757,9 @@ function pickThinking(oa, maxTokens) {
 }
 // Collect a streaming upstream attempt without writing to the client, so the
 // caller can decide (content vs empty/broken) before delivering anything.
-function collectStreamAttempt(antiBody, apiKey) {
+function collectStreamAttempt(antiBody, apiKey, nameMap) {
   return new Promise(function (resolve, reject) {
-    const st = newStreamState(antiBody.model || "probe");
+    const st = newStreamState(antiBody.model || "probe", nameMap);
     const collect = { raw: "", frames: 0 };
     let settled = false;
     function settle(v) { if (!settled) { settled = true; resolve(v); } }
@@ -932,7 +950,8 @@ async function handleChatCompletions(req, res) {
   const conv = openaiMessagesToAnthropic(oa.messages);
   const antiBody = { model: model, max_tokens: pickMaxTokens(oa), messages: conv.messages };
   if (conv.system) { antiBody.system = conv.system; }
-  const tools = convertToolsToAnthropic(oa.tools);
+  const toolNameMap = {};
+  const tools = convertToolsToAnthropic(oa.tools, toolNameMap);
   if (tools) { antiBody.tools = tools; }
   const toolChoice = convertToolChoiceToAnthropic(oa.tool_choice);
   if (toolChoice) { antiBody.tool_choice = toolChoice; }
@@ -992,13 +1011,13 @@ async function handleChatCompletions(req, res) {
           readUpstreamError(upRes, function (err) { upstreamFailed(err); });
           return;
         }
-        pipeStreamToClient(upReq, upRes, res, model);
+        pipeStreamToClient(upReq, upRes, res, model, toolNameMap);
       });
       return;
     }
     let attempt = null;
     try {
-      attempt = await collectStreamAttempt(antiBody, apiKey);
+      attempt = await collectStreamAttempt(antiBody, apiKey, toolNameMap);
     } catch (e) { upstreamFailed(e); return; }
     completion = synthesisToCompletion(attempt.st, model);
   } else {
@@ -1017,7 +1036,7 @@ async function handleChatCompletions(req, res) {
       content: blocks,
       stop_reason: r.stop || (r.toolBlocks.length > 0 ? "tool_use" : "end_turn"),
       usage: { input_tokens: r.inT, output_tokens: r.outT }
-    }, model);
+    }, model, toolNameMap);
     try {
       console.log("[chat] mode=direct model=" + model + " inTok=" + r.inT
         + " outTok=" + r.outT + " ms=" + (Date.now() - t1) + " chunks=" + r.chunks
