@@ -164,6 +164,28 @@ function openaiMessagesToAnthropic(oaMessages) {
   const systemParts = [];
   const messages = [];
   const list = Array.isArray(oaMessages) ? oaMessages : [];
+  // Anthropic/Bedrock rejects a request if any tool_use id repeats within it
+  // ("Invalid tool use format" / REQUEST_BODY_INVALID -> gateway 502). Long
+  // agentic sessions can reuse or collide ids (the upstream recycles
+  // toolu_bdrk_* ids, clients echo them back). Rewrite every tool_use id to a
+  // fresh unique id and remap the matching tool_result ids in call order
+  // (FIFO per original id), so one collision can't poison the conversation.
+  const pending = {};
+  function freshToolUseId(origId) {
+    const id = nextId("toolu_");
+    const key = origId || "";
+    if (!pending[key]) { pending[key] = []; }
+    pending[key].push(id);
+    return id;
+  }
+  function matchToolResultId(origId) {
+    const key = origId || "";
+    const q = pending[key];
+    if (q && q.length > 0) { return q.shift(); }
+    // No matching tool_use seen; pass the original through so Anthropic can
+    // surface a clear error rather than inventing an unmatched id.
+    return origId || nextId("toolu_");
+  }
   for (const m of list) {
     if (!m || typeof m !== "object") { continue; }
     const role = m.role || "user";
@@ -176,7 +198,7 @@ function openaiMessagesToAnthropic(oaMessages) {
       continue;
     }
     if (role === "tool") {
-      const toolId = m.tool_call_id || m.id || nextId("toolu_");
+      const toolId = matchToolResultId(m.tool_call_id || m.id || "");
       const text = typeof m.content === "string" ? m.content : JSON.stringify(m.content);
       messages.push({
         role: "user",
@@ -193,7 +215,7 @@ function openaiMessagesToAnthropic(oaMessages) {
         let input = {};
         try { input = fn.arguments ? JSON.parse(fn.arguments) : {}; }
         catch (e) { input = { raw: fn.arguments || "" }; }
-        blocks.push({ type: "tool_use", id: tc.id || nextId("toolu_"), name: fn.name || "unknown", input: input });
+        blocks.push({ type: "tool_use", id: freshToolUseId(tc.id), name: fn.name || "unknown", input: input });
       }
       messages.push({ role: "assistant", content: blocks });
       continue;
